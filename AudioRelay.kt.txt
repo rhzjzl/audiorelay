@@ -1,0 +1,358 @@
+package com.example.audiorelay
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Bundle
+import android.os.IBinder
+import android.text.InputType
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+
+const val PORT = 5005
+
+// ---------------------------------------------------------------- helpers
+
+fun Service.startFg(text: String, type: Int) {
+    val ch = "relay"
+    val nm = getSystemService(NotificationManager::class.java)
+    nm.createNotificationChannel(
+        NotificationChannel(ch, "Audio Relay", NotificationManager.IMPORTANCE_LOW)
+    )
+    val n = Notification.Builder(this, ch)
+        .setContentTitle("Audio Relay")
+        .setContentText(text)
+        .setSmallIcon(android.R.drawable.ic_media_play)
+        .build()
+    startForeground(1, n, type)
+}
+
+fun Service.newWifiLock(): WifiManager.WifiLock {
+    val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+    val lock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "relay")
+    lock.acquire()
+    return lock
+}
+
+// ---------------------------------------------------------------- screen
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var ipInput: EditText
+    private lateinit var status: TextView
+    private lateinit var myIp: TextView
+
+    private val permLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+
+    private val projectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { r ->
+        val data = r.data
+        if (r.resultCode == Activity.RESULT_OK && data != null) {
+            val ip = ipInput.text.toString().trim()
+            getSharedPreferences("p", Context.MODE_PRIVATE).edit().putString("ip", ip).apply()
+            startForegroundService(
+                Intent(this, SenderService::class.java)
+                    .putExtra("code", r.resultCode)
+                    .putExtra("data", data)
+                    .putExtra("ip", ip)
+            )
+            status.text = "Sending audio to $ip"
+        } else {
+            status.text = "Screen-capture permission denied"
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        permLauncher.launch(perms.toTypedArray())
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 96, 48, 48)
+        }
+
+        fun label(t: String, size: Float = 16f) = TextView(this).apply {
+            text = t
+            textSize = size
+            setPadding(0, 24, 0, 8)
+        }
+
+        fun button(t: String, onClick: () -> Unit) = Button(this).apply {
+            text = t
+            setOnClickListener { onClick() }
+        }
+
+        root.addView(label("Audio Relay", 28f))
+
+        // ---- PHONE MODE ----
+        root.addView(label("PHONE (plays the sound)", 18f))
+        myIp = label("")
+        root.addView(myIp)
+        root.addView(button("Start receiving") {
+            startForegroundService(Intent(this, ReceiverService::class.java))
+            status.text = "Receiving on port $PORT"
+            myIp.text = "This device's IP:\n" + localIps()
+        })
+        root.addView(button("Stop receiving") {
+            stopService(Intent(this, ReceiverService::class.java))
+            status.text = "Stopped"
+        })
+
+        // ---- TABLET MODE ----
+        root.addView(label("TABLET (sends the sound)", 18f))
+        ipInput = EditText(this).apply {
+            hint = "Phone IP, e.g. 192.168.43.1"
+            inputType = InputType.TYPE_CLASS_PHONE
+            setText(getSharedPreferences("p", Context.MODE_PRIVATE).getString("ip", ""))
+        }
+        root.addView(ipInput)
+        root.addView(button("Start sending") {
+            when {
+                checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                        != PackageManager.PERMISSION_GRANTED ->
+                    status.text = "Allow the microphone permission first, then tap again"
+                ipInput.text.isBlank() -> status.text = "Enter the phone's IP first"
+                else -> {
+                    val mpm = getSystemService(MediaProjectionManager::class.java)
+                    projectionLauncher.launch(mpm.createScreenCaptureIntent())
+                }
+            }
+        })
+        root.addView(button("Stop sending") {
+            stopService(Intent(this, SenderService::class.java))
+            status.text = "Stopped"
+        })
+
+        status = label("Ready")
+        root.addView(status)
+
+        setContentView(ScrollView(this).apply { addView(root) })
+        myIp.text = "This device's IP:\n" + localIps()
+    }
+
+    private fun localIps(): String {
+        val list = mutableListOf<String>()
+        try {
+            for (ni in NetworkInterface.getNetworkInterfaces()) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (a in ni.inetAddresses) {
+                    if (a is Inet4Address) list.add("${a.hostAddress} (${ni.name})")
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return if (list.isEmpty()) "not connected" else list.joinToString("\n")
+    }
+}
+
+// ---------------------------------------------------------------- tablet side
+
+class SenderService : Service() {
+
+    @Volatile private var running = false
+    private var projection: MediaProjection? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        startFg("Sending tablet audio", ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        wifiLock = newWifiLock()
+
+        val code = intent.getIntExtra("code", 0)
+        val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+            intent.getParcelableExtra("data", Intent::class.java)
+        else
+            @Suppress("DEPRECATION") intent.getParcelableExtra("data")
+        val ip = intent.getStringExtra("ip") ?: ""
+
+        if (data == null || ip.isEmpty()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val mpm = getSystemService(MediaProjectionManager::class.java)
+        projection = mpm.getMediaProjection(code, data)
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                stopSelf()
+            }
+        }, null)
+
+        running = true
+        Thread { capture(ip) }.start()
+        return START_NOT_STICKY
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun capture(ip: String) {
+        var rec: AudioRecord? = null
+        var socket: DatagramSocket? = null
+        try {
+            val cfg = AudioPlaybackCaptureConfiguration.Builder(projection!!)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build()
+            val fmt = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(48000)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build()
+            val minBuf = AudioRecord.getMinBufferSize(
+                48000, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            rec = AudioRecord.Builder()
+                .setAudioFormat(fmt)
+                .setBufferSizeInBytes(minBuf * 4)
+                .setAudioPlaybackCaptureConfig(cfg)
+                .build()
+
+            socket = DatagramSocket()
+            val addr = InetAddress.getByName(ip)
+            // 320 frames * 2 channels * 2 bytes = 1280 bytes, fits in one Wi-Fi packet
+            val buf = ByteArray(1280)
+
+            rec.startRecording()
+            while (running) {
+                val n = rec.read(buf, 0, buf.size)
+                if (n > 0) socket.send(DatagramPacket(buf, n, addr, PORT))
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            try { rec?.stop() } catch (_: Exception) {}
+            rec?.release()
+            socket?.close()
+            stopSelf()
+        }
+    }
+
+    override fun onDestroy() {
+        running = false
+        projection?.stop()
+        wifiLock?.release()
+        super.onDestroy()
+    }
+}
+
+// ---------------------------------------------------------------- phone side
+
+class ReceiverService : Service() {
+
+    @Volatile private var running = false
+    private var socket: DatagramSocket? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startFg("Playing tablet audio", ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        wifiLock = newWifiLock()
+        if (!running) {
+            running = true
+            Thread { receive() }.start()
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun receive() {
+        var track: AudioTrack? = null
+        try {
+            val rate = 48000
+            val minBuf = AudioTrack.getMinBufferSize(
+                rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            // about 125 ms of buffer: absorbs Wi-Fi jitter. Lower = less delay, more crackle.
+            val bufSize = maxOf(minBuf, 24000)
+
+            track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(rate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
+            // small socket buffer so old packets get dropped instead of piling up as delay
+            val s = DatagramSocket(null)
+            s.reuseAddress = true
+            s.receiveBufferSize = 16384
+            s.bind(InetSocketAddress(PORT))
+            socket = s
+
+            // pre-fill with ~60 ms of silence so playback starts smoothly
+            val silence = ByteArray(11520)
+            track.write(silence, 0, silence.size)
+            track.play()
+
+            val buf = ByteArray(2048)
+            val packet = DatagramPacket(buf, buf.size)
+            while (running) {
+                s.receive(packet)
+                track.write(packet.data, 0, packet.length)
+            }
+        } catch (e: Exception) {
+            if (running) e.printStackTrace()
+        } finally {
+            try { track?.stop() } catch (_: Exception) {}
+            track?.release()
+            socket?.close()
+        }
+    }
+
+    override fun onDestroy() {
+        running = false
+        socket?.close()
+        wifiLock?.release()
+        super.onDestroy()
+    }
+}
